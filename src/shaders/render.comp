@@ -1,0 +1,175 @@
+#version 450
+#extension GL_GOOGLE_include_directive: enable
+#include "./common.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64: enable
+//#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout (std430, set = 0, binding = 0) buffer Vertices {
+    VertexAttribute attr[];
+};
+
+layout (std430, set = 0, binding = 1) readonly buffer Boundaries {
+    uint boundaries[];
+};
+
+layout (std430, set = 0, binding = 2) readonly buffer SortedVertices {
+    uint sorted_vertices[];
+};
+
+layout (std140, set = 0, binding = 3) uniform Params {
+    float mouseX;
+    float mouseY;
+    uint mouseFlags;
+    float radius;
+    float strength;
+};
+
+
+layout (set = 1, binding = 0) uniform writeonly image2D output_image;
+
+layout (push_constant) uniform Constants
+{
+    uint width;
+    uint height;
+};
+
+layout (local_size_x = TILE_WIDTH, local_size_y = TILE_HEIGHT, local_size_z = 1) in;
+
+vec3 bwShading(vec3 color, int steps) {
+    float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    float quantized = floor(luminance * float(steps)) / float(steps);
+
+    return vec3(quantized);
+}
+
+vec3 toonShading(vec3 color, int steps) {
+    float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+
+    float quantized = floor(luminance * float(steps)) / float(steps);
+
+    color *= 1.5 * quantized + 0.2;
+
+    //    return vec3(quantized);
+    return color;
+}
+
+vec3 quantize(vec3 color) {
+    float r_quantized = 0.7 + color.x * (0.3 - 0.1);
+    float g_quantized = 0.7 + color.y * (0.3 - 0.1);
+    float b_quantized = 0.7 + color.z * (0.3 - 0.1);
+    return vec3(r_quantized, g_quantized, b_quantized);
+}
+
+vec3 warmCoolShading(vec3 baseColor, vec3 n, vec3 l) {
+    const float b = 0.30;
+    const float y = 0.30;
+    const float alpha = 0.33;
+    const float beta = 0.66;
+    const vec3 blue = vec3(222, 59, 102) / 255.0f;
+    const vec3 yellow = vec3(128, 59, 255) / 255.0f;
+
+
+    vec3 coolColor = b * blue + alpha * baseColor;
+    vec3 warmColor = y * yellow + beta * baseColor;
+
+    float diffuse = dot(n, l) * 0.5 + 0.5;
+    return mix(coolColor, warmColor, diffuse);
+}
+
+void main() {
+    uint tileX = gl_WorkGroupID.x;
+    uint tileY = gl_WorkGroupID.y;
+    uint localX = gl_LocalInvocationID.x;
+    uint localY = gl_LocalInvocationID.y;
+
+    uvec2 curr_uv = uvec2(tileX * TILE_WIDTH + localX, tileY * TILE_HEIGHT + localY);
+    if (curr_uv.x >= width || curr_uv.y >= height) {
+        return;
+    }
+
+    uint tiles_width = ((width + TILE_WIDTH - 1) / TILE_WIDTH);
+
+    uint start = boundaries[(tileX + tileY * tiles_width) * 2];
+    uint end = boundaries[(tileX + tileY * tiles_width) * 2 + 1];
+
+    float T = 1.0f;
+    vec3 c = vec3(0.0f);
+    float fWidth = float(width);
+    float fHeight = float(height);
+
+    vec2 mouse = vec2(mouseX, mouseY);
+
+    if (gl_GlobalInvocationID.x == 10000) {
+        //        debugPrintfEXT("c %f %f %f\n", attr[vertex_key].color_radii.x, attr[vertex_key].color_radii.y, attr[vertex_key].color_radii.z);
+        //        debugPrintfEXT("uv %d %d\n", attr[vertex_key].uv.x, attr[vertex_key].uv.y);
+        //        debugPrintfEXT("curr_uv %d %d\n", curr_uv.x, curr_uv.y);
+        //        debugPrintfEXT("co %f %f %f %f\n", attr[vertex_key].conic_opacity.x, attr[vertex_key].conic_opacity.y, attr[vertex_key].conic_opacity.z, attr[vertex_key].conic_opacity.w);
+    }
+
+    if (start > end && gl_LocalInvocationIndex == 0) {
+        //        debugPrintfEXT("ERROR ----- start %d end %d at %d (TX %d TY %d wid %d)\n", start, end, tileX + tileY * tiles_width, tileX, tileY, tiles_width);
+        //        debugPrintfEXT("      ----- %d %d %d %d\n", boundaries[tileX + tileY * tiles_width - 2], boundaries[tileX + tileY * tiles_width - 1], boundaries[tileX + tileY * tiles_width + 2], boundaries[tileX + tileY * tiles_width + 3]);
+    }
+
+    int numLevels = 3;
+
+    for (uint i = start; i < end; i++) {
+        uint vertex_key = sorted_vertices[i];
+        vec2 uv = attr[vertex_key].uv;
+        vec2 distance = uv - vec2(curr_uv);
+        vec4 co = attr[vertex_key].conic_opacity;
+        float power = -0.5f * (co.x * distance.x * distance.x + co.z * distance.y * distance.y) - co.y * distance.x * distance.y;
+
+        if (power > 0.0f) {
+            continue;
+        }
+
+        if (gl_GlobalInvocationID.x == 100) {
+            //            debugPrintfEXT("radius %f\n", attr[vertex_key].color_radii.w);
+        }
+
+
+        float alpha = min(0.99f, co.w * exp(power));
+        if (alpha < 1.0f / 255.0f) {
+            continue;
+        }
+
+        float test_T = T * (1 - alpha);
+        if (test_T < 0.0001f) {
+            break;
+        }
+
+
+        if ((((mouseFlags >> 2) & 1) == 1) && test_T > (1 - strength / 150 - 0.2) && length(mouse - uv) < radius) {
+            mat3 rotation = rotationFromQuaternion(attr[vertex_key].rotation);
+            if (((attr[vertex_key].flags & 1) == 0)) {
+                if ((mouseFlags >> 4 & 1) == 1)
+                attr[vertex_key].color_radii.xyz = toonShading(attr[vertex_key].color_radii.xyz, numLevels);
+                attr[vertex_key].flags |= 1;
+            }
+            if ((mouseFlags >> 5 & 1) == 1)
+            attr[vertex_key].color_radii.xyz = bwShading(attr[vertex_key].color_radii.xyz, numLevels);
+            else if ((mouseFlags >> 6 & 1) == 1)
+            attr[vertex_key].color_radii.xyz = warmCoolShading(attr[vertex_key].color_radii.xyz,
+                                                               rotation * vec3(0, 0, 1), vec3(-0.8f, -1.0f, -0.3f));
+            else if ((mouseFlags >> 7 & 1) == 1)
+                attr[vertex_key].flags = 0;
+
+            //            attr[vertex_key].color_radii.xyz = quantize(attr[vertex_key].color_radii.xyz);
+        }
+
+        // c += vec3(1.0,0,0) * alpha * T;
+        c += attr[vertex_key].color_radii.xyz * alpha * T;
+        T = test_T;
+    }
+
+    //    if (index == 10000) {
+    //        debugPrintfEXT("c %f %f %f\n", c.x, c.y, c.z);
+    //    }
+
+    // set pixel to red
+    //    ivec2 pixel_coords = ivec2(curr_uv);
+    //    imageStore(output_image, ivec2(curr_uv), vec4(1.0, 0.0, 0.0, 1.0));
+    imageStore(output_image, ivec2(curr_uv), vec4(c, 1.0f));
+}
